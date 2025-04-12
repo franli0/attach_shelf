@@ -1,0 +1,5 @@
+# Request
+bool attach_to_shelf
+---
+# Response
+bool complete
