@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Parameters with default values -->
+  <arg name="obstacle" default="0.5"/>
+  <arg name="degrees" default="-90"/>
+  
+  <!-- Launch pre_approach node -->
+  <node pkg="attach_shelf" exec="pre_approach" name="pre_approach_node" output="screen">
+    <param name="obstacle" value="$(var obstacle)"/>
+    <param name="degrees" value="$(var degrees)"/>
+  </node>
+  
+  <!-- Launch RViz -->
+  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen">
+    <param name="use_sim_time" value="true"/>
+    <param name="default_display" value="rviz/pre_approach.rviz"/>
+  </node>
+</launch>
