@@ -17,6 +17,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 # Generate custom service message
@@ -54,6 +55,7 @@ ament_target_dependencies(approach_service_server
   sensor_msgs
   geometry_msgs
   std_msgs
+  tf2_ros
 )
 target_link_libraries(approach_service_server "${cpp_typesupport_target}")
 
