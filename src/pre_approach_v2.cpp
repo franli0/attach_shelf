@@ -52,7 +52,7 @@ public:
             std::chrono::milliseconds(50),  // Faster update rate for smoother control
             std::bind(&PreApproachV2Node::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "Publishing velocity commands to /diffbot_base_controller/cmd_vel_unstamped");
+        RCLCPP_INFO(this->get_logger(), "Publishing velocity commands to /robot/cmd_vel");
     }
 
 private:
@@ -60,6 +60,7 @@ private:
         MOVING_FORWARD,
         ROTATING,
         CALLING_SERVICE,
+        WAITING_FOR_SERVICE_RESULT,
         STOPPED
     };
     
@@ -90,7 +91,7 @@ private:
         double z = msg->pose.pose.orientation.z;
         double w = msg->pose.pose.orientation.w;
         
-        // Convert quaternion to yaw (simpler version without tf2)
+        // Convert quaternion to yaw
         double siny_cosp = 2.0 * (w * z + x * y);
         double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
         current_yaw_ = std::atan2(siny_cosp, cosy_cosp);
@@ -190,9 +191,47 @@ private:
                 
                 // Call the approach service
                 if (!service_called_) {
-                    call_approach_service();
+                    RCLCPP_INFO(this->get_logger(), "Preparing to call approach_shelf service...");
+                    
+                    // Wait for service to be available with a timeout
+                    RCLCPP_INFO(this->get_logger(), "Waiting for approach_shelf service to be available...");
+                    if (!client_->wait_for_service(std::chrono::seconds(2))) {
+                        RCLCPP_ERROR(this->get_logger(), "Service /approach_shelf not available, retrying later");
+                        break;
+                    }
+                    
+                    // Create request
+                    auto request = std::make_shared<attach_shelf::srv::GoToLoading::Request>();
+                    request->attach_to_shelf = final_approach_;
+                    
+                    RCLCPP_INFO(this->get_logger(), "Calling approach service with attach_to_shelf=%s", 
+                              final_approach_ ? "true" : "false");
+                    
+                    // Send async request without blocking or spinning the node
+                    auto callback = [this](rclcpp::Client<attach_shelf::srv::GoToLoading>::SharedFuture future) {
+                        try {
+                            auto result = future.get();
+                            RCLCPP_INFO(this->get_logger(), "Service call completed with result: %s", 
+                                      result->complete ? "success" : "failure");
+                        } catch (const std::exception &e) {
+                            RCLCPP_ERROR(this->get_logger(), "Service call failed: %s", e.what());
+                        }
+                        state_ = STOPPED;
+                    };
+                    
+                    auto future_result = client_->async_send_request(request, callback);
+                    
                     service_called_ = true;
+                    state_ = WAITING_FOR_SERVICE_RESULT;
+                    RCLCPP_INFO(this->get_logger(), "Service call sent, waiting for result");
                 }
+                break;
+            }
+            case WAITING_FOR_SERVICE_RESULT:
+            {
+                // Just wait, doing nothing while the service executes
+                cmd_vel.linear.x = 0.0;
+                cmd_vel.angular.z = 0.0;
                 break;
             }
             case STOPPED:
@@ -205,35 +244,6 @@ private:
         }
         
         vel_publisher_->publish(cmd_vel);
-    }
-    
-    void call_approach_service()
-    {
-        // Wait for service to be available with a timeout
-        if (!client_->wait_for_service(std::chrono::seconds(1))) {
-            RCLCPP_ERROR(this->get_logger(), "Service /approach_shelf not available. Retrying...");
-            service_called_ = false;  // Reset to try again next iteration
-            return;
-        }
-        
-        // Create request
-        auto request = std::make_shared<attach_shelf::srv::GoToLoading::Request>();
-        request->attach_to_shelf = final_approach_;
-        
-        RCLCPP_INFO(this->get_logger(), "Calling approach service with attach_to_shelf=%s", 
-                   final_approach_ ? "true" : "false");
-        
-        // Send async request
-        auto result_future = client_->async_send_request(
-            request,
-            [this](rclcpp::Client<attach_shelf::srv::GoToLoading>::SharedFuture future) {
-                auto result = future.get();
-                RCLCPP_INFO(this->get_logger(), "Service call completed with result: %s", 
-                           result->complete ? "success" : "failure");
-                
-                state_ = STOPPED;
-            }
-        );
     }
     
     // Node state variables
