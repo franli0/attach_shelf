@@ -1,7 +1,8 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     # Declare launch arguments
@@ -22,6 +23,10 @@ def generate_launch_description():
         default_value='true',
         description='Whether to perform the final approach after pre-approach'
     )
+    
+    # Define paths to RViz config files
+    pkg_share = FindPackageShare('attach_shelf')
+    rviz_config_path = PathJoinSubstitution([pkg_share, 'rviz', 'attach_to_shelf.rviz'])
     
     # Define the nodes to launch
     approach_service_server_node = Node(
@@ -49,17 +54,15 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='screen',
-        arguments=['-d', [LaunchConfiguration('final_approach'), ' == "true" ',
-                           ' && ', '$(find-pkg-share attach_shelf)/config/attach_to_shelf.rviz',
-                           ' || ', '$(find-pkg-share attach_shelf)/config/pre_approach.rviz']]
+        arguments=['-d', rviz_config_path]
     )
     
     # Return the launch description
     return LaunchDescription([
         obstacle_arg,
         degrees_arg,
+        pre_approach_v2_node,
         final_approach_arg,
         approach_service_server_node,
-        pre_approach_v2_node,
         rviz_node
     ])
