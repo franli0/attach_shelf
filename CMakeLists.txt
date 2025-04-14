@@ -56,6 +56,7 @@ ament_target_dependencies(approach_service_server
   geometry_msgs
   std_msgs
   tf2_ros
+  nav_msgs
 )
 target_link_libraries(approach_service_server "${cpp_typesupport_target}")
 
