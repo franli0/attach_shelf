@@ -52,7 +52,13 @@ public:
             std::chrono::milliseconds(50),  // Faster update rate for smoother control
             std::bind(&PreApproachV2Node::timer_callback, this));
             
-        RCLCPP_INFO(this->get_logger(), "Publishing velocity commands to /robot/cmd_vel");
+        RCLCPP_INFO(this->get_logger(), "Publishing velocity commands to /diffbot_base_controller/cmd_vel_unstamped");
+        
+        // Publish a zero velocity command to ensure connection is established
+        geometry_msgs::msg::Twist cmd_vel;
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.angular.z = 0.0;
+        vel_publisher_->publish(cmd_vel);
     }
 
 private:
@@ -167,6 +173,10 @@ private:
                     
                     cmd_vel.linear.x = 0.0;
                     cmd_vel.angular.z = angular_velocity;
+                    
+                    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                                "Rotating, rotated: %f, remaining: %f, cmd: %f", 
+                                rotated_amount, remaining_rotation, angular_velocity);
                 }
                 else
                 {
@@ -195,9 +205,11 @@ private:
                     
                     // Wait for service to be available with a timeout
                     RCLCPP_INFO(this->get_logger(), "Waiting for approach_shelf service to be available...");
-                    if (!client_->wait_for_service(std::chrono::seconds(2))) {
-                        RCLCPP_ERROR(this->get_logger(), "Service /approach_shelf not available, retrying later");
-                        break;
+                    if (!client_->wait_for_service(std::chrono::seconds(5))) {
+                        RCLCPP_ERROR(this->get_logger(), "Service /approach_shelf not available after 5 seconds");
+                        // Wait a bit then try again
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        return;
                     }
                     
                     // Create request
