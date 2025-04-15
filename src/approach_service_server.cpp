@@ -22,16 +22,15 @@ public:
         service_in_progress_ = false;
         legs_detected_ = false;
         cart_frame_published_ = false;
-        rotation_complete_ = false;
         
         // Initialize position tracking
         robot_x_ = 0.0;
         robot_y_ = 0.0;
         robot_yaw_ = 0.0;
-        target_x_ = 0.0;
-        target_y_ = 0.0;
-        prev_x_ = 0.0;
-        prev_y_ = 0.0;
+        start_x_ = 0.0;
+        start_y_ = 0.0;
+        cart_x_ = 0.0;
+        cart_y_ = 0.0;
         distance_moved_ = 0.0;
         
         // Create publishers and subscribers
@@ -88,27 +87,6 @@ private:
         double siny_cosp = 2.0 * (w * z + x * y);
         double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
         robot_yaw_ = std::atan2(siny_cosp, cosy_cosp);
-        
-        // Track distance moved for under-shelf movement
-        if (state_ == MOVING_UNDER_SHELF && prev_x_ != 0.0) {
-            double dx = robot_x_ - prev_x_;
-            double dy = robot_y_ - prev_y_;
-            double delta_dist = std::sqrt(dx*dx + dy*dy);
-            
-            // Add to total distance if we're moving forward (not backward)
-            // Using the dot product with forward direction
-            double forward_x = std::cos(robot_yaw_);
-            double forward_y = std::sin(robot_yaw_);
-            double dot_product = dx * forward_x + dy * forward_y;
-            
-            if (dot_product > 0) {
-                distance_moved_ += delta_dist;
-            }
-        }
-        
-        // Store current position for next distance calculation
-        prev_x_ = robot_x_;
-        prev_y_ = robot_y_;
     }
     
     void handle_service(
@@ -128,8 +106,16 @@ private:
         attach_to_shelf_ = request->attach_to_shelf;
         legs_detected_ = false;
         cart_frame_published_ = false;
-        reached_cart_position_ = false;
-        distance_moved_ = 0.0;
+        
+        // Save the starting position as our reference point
+        start_x_ = robot_x_;
+        start_y_ = robot_y_;
+        start_yaw_ = robot_yaw_;
+        
+        RCLCPP_INFO(this->get_logger(), "Setting reference position at (%.2f, %.2f), yaw: %.2f", 
+                   start_x_, start_y_, start_yaw_);
+        
+        // Record the start time
         start_time_ = this->now();
         
         // Start the state machine
@@ -155,12 +141,6 @@ private:
                 
                 RCLCPP_INFO(this->get_logger(), "Service running... %d/%d, state=%s", 
                            i+1, timeout_seconds, state_str.c_str());
-                
-                // Include position information in the log
-                if (state_ == MOVING_TO_CART || state_ == MOVING_UNDER_SHELF) {
-                    RCLCPP_INFO(this->get_logger(), "Robot at (%.2f, %.2f), Target at (%.2f, %.2f)", 
-                               robot_x_, robot_y_, target_x_, target_y_);
-                }
             }
             
             if (service_in_progress_) {
@@ -193,6 +173,7 @@ private:
         if (msg->intensities.empty()) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
                 "No intensity data available in laser scan");
+            return;
         }
         
         const float INTENSITY_THRESHOLD = 7500.0;  // Reflective markers should have very high intensity
@@ -200,7 +181,6 @@ private:
         
         // Store any high-intensity points (potential shelf legs)
         std::vector<std::pair<double, double>> high_intensity_points;
-        std::vector<float> intensities_found;
         
         // Find maximum intensity in scan for diagnostic purposes
         float max_intensity = 0.0f;
@@ -226,7 +206,10 @@ private:
                 double y = msg->ranges[i] * std::sin(angle);
                 
                 high_intensity_points.push_back(std::make_pair(x, y));
-                intensities_found.push_back(msg->intensities[i]);
+                
+                // Debug logging for detected high intensity points
+                RCLCPP_DEBUG(this->get_logger(), "High intensity point detected at (%.2f, %.2f) with intensity %.1f",
+                            x, y, msg->intensities[i]);
             }
         }
         
@@ -246,41 +229,87 @@ private:
         
         // If we found enough high intensity points to detect shelf legs
         if (high_intensity_points.size() >= 2) {
-            // Sort points by Y value to find the leftmost and rightmost legs
+            // Make sure we have enough valid points
+            if (high_intensity_points.size() < 2) {
+                RCLCPP_WARN(this->get_logger(), "Not enough valid high intensity points to detect legs");
+                return;
+            }
+            
+            // Find points with the most extreme y values for better leg detection
             std::sort(high_intensity_points.begin(), high_intensity_points.end(),
                      [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
                          return a.second < b.second;
                      });
             
-            // Take the points with the smallest and largest Y values (leftmost and rightmost)
-            auto leg1 = high_intensity_points.front();
-            auto leg2 = high_intensity_points.back();
+            // Get the points with extreme Y values (most left and right)
+            auto left_points = std::vector<std::pair<double, double>>();
+            auto right_points = std::vector<std::pair<double, double>>();
             
-            // Calculate cart position (midpoint between legs)
-            cart_position_x_ = (leg1.first + leg2.first) / 2.0;
-            cart_position_y_ = (leg1.second + leg2.second) / 2.0;
+            // Consider the 20% leftmost and 20% rightmost points
+            size_t num_extreme_points = std::max(size_t(1), high_intensity_points.size() / 5);
+            
+            // Get leftmost points
+            for (size_t i = 0; i < num_extreme_points && i < high_intensity_points.size(); i++) {
+                left_points.push_back(high_intensity_points[i]);
+            }
+            
+            // Get rightmost points
+            for (size_t i = 0; i < num_extreme_points && i < high_intensity_points.size(); i++) {
+                right_points.push_back(high_intensity_points[high_intensity_points.size() - 1 - i]);
+            }
+            
+            // Calculate average position of left leg
+            double left_x_sum = 0.0, left_y_sum = 0.0;
+            for (const auto& point : left_points) {
+                left_x_sum += point.first;
+                left_y_sum += point.second;
+            }
+            double left_x_avg = left_x_sum / left_points.size();
+            double left_y_avg = left_y_sum / left_points.size();
+            
+            // Calculate average position of right leg
+            double right_x_sum = 0.0, right_y_sum = 0.0;
+            for (const auto& point : right_points) {
+                right_x_sum += point.first;
+                right_y_sum += point.second;
+            }
+            double right_x_avg = right_x_sum / right_points.size();
+            double right_y_avg = right_y_sum / right_points.size();
+            
+            // Store leg positions for approach planning
+            left_leg_x_ = left_x_avg;
+            left_leg_y_ = left_y_avg;
+            right_leg_x_ = right_x_avg;
+            right_leg_y_ = right_y_avg;
+            
+            // Calculate cart position (midpoint between legs) in robot frame
+            initial_cart_x_ = (left_leg_x_ + right_leg_x_) / 2.0;
+            initial_cart_y_ = (left_leg_y_ + right_leg_y_) / 2.0;
+            
+            // Store for publishing the TF
+            cart_x_ = initial_cart_x_;
+            cart_y_ = initial_cart_y_;
             
             // Calculate leg distance for validation
             double leg_distance = std::sqrt(
-                std::pow(leg2.first - leg1.first, 2) + 
-                std::pow(leg2.second - leg1.second, 2));
+                std::pow(right_leg_x_ - left_leg_x_, 2) + 
+                std::pow(right_leg_y_ - left_leg_y_, 2));
             
             RCLCPP_INFO(this->get_logger(), 
-                "Shelf legs detected! Leg1: (%.2f, %.2f), Leg2: (%.2f, %.2f), Distance: %.2f m",
-                leg1.first, leg1.second, leg2.first, leg2.second, leg_distance);
+                "Shelf legs detected! Left leg: (%.2f, %.2f), Right leg: (%.2f, %.2f), Distance: %.2f m",
+                left_leg_x_, left_leg_y_, right_leg_x_, right_leg_y_, leg_distance);
             
-            RCLCPP_INFO(this->get_logger(), "Cart frame position set to (%.2f, %.2f)",
-                cart_position_x_, cart_position_y_);
+            RCLCPP_INFO(this->get_logger(), "Initial cart frame position set to (%.2f, %.2f) relative to robot",
+                initial_cart_x_, initial_cart_y_);
             
-            // Transform cart position from robot frame to world frame
-            // Important: Store this position in world frame so it doesn't move as robot moves
-            target_x_ = robot_x_ + cart_position_x_ * std::cos(robot_yaw_) - cart_position_y_ * std::sin(robot_yaw_);
-            target_y_ = robot_y_ + cart_position_x_ * std::sin(robot_yaw_) + cart_position_y_ * std::cos(robot_yaw_);
+            // Convert cart position from robot frame to world frame coordinates
+            target_x_ = robot_x_ + initial_cart_x_ * std::cos(robot_yaw_) - initial_cart_y_ * std::sin(robot_yaw_);
+            target_y_ = robot_y_ + initial_cart_x_ * std::sin(robot_yaw_) + initial_cart_y_ * std::cos(robot_yaw_);
             
-            RCLCPP_INFO(this->get_logger(), "Cart frame in world coordinates: (%.2f, %.2f)",
+            RCLCPP_INFO(this->get_logger(), "Target position in world coordinates: (%.2f, %.2f)",
                 target_x_, target_y_);
             
-            // Mark legs as detected
+            // Mark legs as detected and cart frame as published
             legs_detected_ = true;
             cart_frame_published_ = true;
             
@@ -292,11 +321,9 @@ private:
             
             // Start movement to cart
             state_ = MOVING_TO_CART;
-            move_start_time_ = this->now();
-            movement_phase_duration_ = 0.0;
             
         } else if (service_in_progress_ && state_ == DETECTING_LEGS) {
-            // If service is running but we couldn't find legs after some time, use fallback
+            // Check how long we've been trying to detect legs
             rclcpp::Duration elapsed = this->now() - start_time_;
             
             if (elapsed.seconds() > 5.0) {  // After 5 seconds without legs detected
@@ -305,19 +332,24 @@ private:
                     elapsed.seconds());
                 
                 // Use fallback position in front of the robot
-                cart_position_x_ = 0.75;  // 75cm forward
-                cart_position_y_ = 0.0;   // Centered
+                initial_cart_x_ = 0.75;  // 75cm forward
+                initial_cart_y_ = 0.0;   // Centered
                 
-                // Transform to world coordinates
-                target_x_ = robot_x_ + cart_position_x_ * std::cos(robot_yaw_) - cart_position_y_ * std::sin(robot_yaw_);
-                target_y_ = robot_y_ + cart_position_x_ * std::sin(robot_yaw_) + cart_position_y_ * std::cos(robot_yaw_);
+                // Store for publishing the TF
+                cart_x_ = initial_cart_x_;
+                cart_y_ = initial_cart_y_;
                 
-                RCLCPP_INFO(this->get_logger(), "Using fallback cart position: (%.2f, %.2f) in robot frame",
-                    cart_position_x_, cart_position_y_);
-                RCLCPP_INFO(this->get_logger(), "Fallback cart position in world coordinates: (%.2f, %.2f)",
+                RCLCPP_INFO(this->get_logger(), "Using fallback cart position: (%.2f, %.2f) relative to robot",
+                    initial_cart_x_, initial_cart_y_);
+                
+                // Convert to world coordinates
+                target_x_ = robot_x_ + initial_cart_x_ * std::cos(robot_yaw_) - initial_cart_y_ * std::sin(robot_yaw_);
+                target_y_ = robot_y_ + initial_cart_x_ * std::sin(robot_yaw_) + initial_cart_y_ * std::cos(robot_yaw_);
+                
+                RCLCPP_INFO(this->get_logger(), "Target position in world coordinates: (%.2f, %.2f)",
                     target_x_, target_y_);
                 
-                // Mark legs as detected
+                // Mark legs as detected and cart frame as published
                 legs_detected_ = true;
                 cart_frame_published_ = true;
                 
@@ -329,8 +361,6 @@ private:
                 
                 // Start movement to cart
                 state_ = MOVING_TO_CART;
-                move_start_time_ = this->now();
-                movement_phase_duration_ = 0.0;
             }
         }
     }
@@ -366,8 +396,8 @@ private:
         transform.header.frame_id = "robot_base_link";
         transform.child_frame_id = "cart_frame";
         
-        transform.transform.translation.x = cart_position_x_;
-        transform.transform.translation.y = cart_position_y_;
+        transform.transform.translation.x = cart_x_;
+        transform.transform.translation.y = cart_y_;
         transform.transform.translation.z = 0.0;
         
         transform.transform.rotation.w = 1.0;
@@ -380,157 +410,105 @@ private:
     
     void execute_move_to_cart()
     {
-        // If we haven't completed rotation yet, first align with the cart frame
-        if (!rotation_complete_) {
-            // Calculate angle to target in robot frame
-            double target_angle = std::atan2(cart_position_y_, cart_position_x_);
+        // Calculate distance to target in world coordinates
+        double dx = target_x_ - robot_x_;
+        double dy = target_y_ - robot_y_;
+        double distance_to_target = std::sqrt(dx*dx + dy*dy);
+        
+        // Calculate angle to target in world frame
+        double target_angle = std::atan2(dy, dx) - robot_yaw_;
+        
+        // Normalize angle to [-π, π]
+        while (target_angle > M_PI) target_angle -= 2*M_PI;
+        while (target_angle < -M_PI) target_angle += 2*M_PI;
+        
+        // Log the current position and target
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Robot at (%.2f, %.2f, %.2f), Target at (%.2f, %.2f), Distance: %.2f, Angle: %.2f",
+            robot_x_, robot_y_, robot_yaw_, target_x_, target_y_, 
+            distance_to_target, target_angle);
+        
+        // If we're close enough to the target
+        if (distance_to_target < 0.1) { // 10cm threshold
+            stop_robot();
+            RCLCPP_INFO(this->get_logger(), "*** REACHED CART POSITION ***");
             
-            // If we're significantly misaligned, rotate to align
-            if (std::abs(target_angle) > 0.05) { // ~3 degrees threshold
-                // Rotate to align with target using proportional control
-                double angular_velocity = 0.5 * target_angle;
-                
-                // Limit angular velocity
-                angular_velocity = std::max(-0.3, std::min(0.3, angular_velocity));
-                
-                geometry_msgs::msg::Twist cmd_vel;
-                cmd_vel.linear.x = 0.0;
-                cmd_vel.angular.z = angular_velocity;
-                vel_publisher_->publish(cmd_vel);
-                
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Aligning with target, angle: %.2f rad, angular velocity: %.2f rad/s", 
-                    target_angle, angular_velocity);
-                return;
-            }
+            // Wait to ensure robot is fully stopped
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             
-            // We've finished rotating, now calculate the target position in world coordinates
-            // by getting the current robot position and adding the offset
-            target_x_ = robot_x_ + cart_position_x_ * std::cos(robot_yaw_) - cart_position_y_ * std::sin(robot_yaw_);
-            target_y_ = robot_y_ + cart_position_x_ * std::sin(robot_yaw_) + cart_position_y_ * std::cos(robot_yaw_);
+            // Calculate target position 60cm further under the shelf
+            // This position is 60cm forward from current position in robot's forward direction
+            under_shelf_x_ = robot_x_ + 0.6 * std::cos(robot_yaw_);
+            under_shelf_y_ = robot_y_ + 0.6 * std::sin(robot_yaw_);
             
-            RCLCPP_INFO(this->get_logger(), "Alignment complete. Setting target at world coordinates: (%.2f, %.2f)", 
-                      target_x_, target_y_);
+            RCLCPP_INFO(this->get_logger(), "*** CALCULATED UNDER-SHELF POSITION (%.2f, %.2f) ***", 
+                       under_shelf_x_, under_shelf_y_);
             
-            // Mark rotation as complete
-            rotation_complete_ = true;
-            
-            // Reset distance for the forward movement phase
-            distance_moved_ = 0.0;
-            linear_move_start_ = this->now();
+            // Transition to under-shelf movement
+            state_ = MOVING_UNDER_SHELF;
+            RCLCPP_INFO(this->get_logger(), "*** STARTING UNDER-SHELF MOVEMENT ***");
             return;
         }
         
-        // For the forward movement phase, if we're not at the cart position yet
-        if (!reached_cart_position_) {
-            // Calculate how long we've been moving (for timeout purposes)
-            rclcpp::Duration elapsed_move = this->now() - linear_move_start_;
-            double movement_time = elapsed_move.seconds();
+        // Calculate linear and angular velocities
+        double forward_speed = 0.3;  // Increased default speed for faster movement
+        double angular_velocity = 0.0;
+        
+        // If we need to make a significant turn first, turn in place
+        if (std::abs(target_angle) > 0.3) {  // Reduced threshold for earlier correction
+            forward_speed = 0.0;  // Stop forward motion
+            // Turn with proportional control - more aggressive
+            angular_velocity = 0.8 * target_angle;
+            // Limit angular velocity
+            angular_velocity = std::max(-0.5, std::min(0.5, angular_velocity));
             
-            // Check for timeout
-            if (movement_time > 15.0) {
-                RCLCPP_ERROR(this->get_logger(), "Timeout reaching cart position. Moving on anyway.");
-                reached_cart_position_ = true;
-                move_start_time_ = this->now();
-                distance_moved_ = 0.0;
-                state_ = MOVING_UNDER_SHELF;
-                return;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Turning in place to align with target, angle: %.2f rad", target_angle);
+        } else {
+            // We're roughly aligned, move forward while steering
+            
+            // Adjust forward speed based on distance and angle
+            if (distance_to_target < 0.3) {
+                forward_speed = 0.15;  // Slightly faster when close
             }
             
-            // Calculate distance to target in world frame
-            double dx = target_x_ - robot_x_;
-            double dy = target_y_ - robot_y_;
-            double distance_to_target = std::sqrt(dx*dx + dy*dy);
+            // More aggressive steering for better alignment
+            angular_velocity = 0.8 * target_angle;
+            // Limit angular velocity
+            angular_velocity = std::max(-0.4, std::min(0.4, angular_velocity));
             
-            // Log the current position and target
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Robot at (%.2f, %.2f, %.2f), Target at (%.2f, %.2f), Distance: %.2f",
-                robot_x_, robot_y_, robot_yaw_, target_x_, target_y_, distance_to_target);
-            
-            // Move until we're close enough to the target
-            if (distance_to_target > 0.05) { // 5cm threshold
-                // Calculate angle to target in robot frame
-                double target_angle = std::atan2(dy, dx) - robot_yaw_;
-                // Normalize angle to [-π, π]
-                while (target_angle > M_PI) target_angle -= 2*M_PI;
-                while (target_angle < -M_PI) target_angle += 2*M_PI;
-                
-                // Set forward speed based on distance, slower when closer
-                double forward_speed = 0.2;
-                if (distance_to_target < 0.3) {
-                    forward_speed = 0.1; // Slow down for last 30cm
-                }
-                
-                // Small steering correction to stay on course
-                double angular_correction = 0.5 * target_angle;
-                angular_correction = std::max(-0.2, std::min(0.2, angular_correction));
-                
-                // Move with combined linear and angular velocities
-                geometry_msgs::msg::Twist cmd_vel;
-                cmd_vel.linear.x = forward_speed;
-                cmd_vel.angular.z = angular_correction;
-                vel_publisher_->publish(cmd_vel);
-                
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Moving toward target at (%.2f, %.2f), distance: %.2f, angle: %.2f", 
-                    target_x_, target_y_, distance_to_target, target_angle);
-            } else {
-                // We've reached the target position
-                stop_robot();
-                RCLCPP_INFO(this->get_logger(), "*** REACHED CART POSITION (%.2f, %.2f) ***", 
-                            target_x_, target_y_);
-                
-                // Wait to ensure robot is fully stopped
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                
-                // Reset for the under-shelf movement
-                reached_cart_position_ = true;
-                move_start_time_ = this->now();
-                distance_moved_ = 0.0;
-                
-                // Transition to under-shelf movement
-                state_ = MOVING_UNDER_SHELF;
-                RCLCPP_INFO(this->get_logger(), "*** STARTING UNDER-SHELF MOVEMENT ***");
-            }
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Moving to target with speed: %.2f m/s, turn rate: %.2f rad/s", 
+                forward_speed, angular_velocity);
         }
+        
+        // Send velocity commands
+        geometry_msgs::msg::Twist cmd_vel;
+        cmd_vel.linear.x = forward_speed;
+        cmd_vel.angular.z = angular_velocity;
+        vel_publisher_->publish(cmd_vel);
+        
+        // Debug output to confirm velocity commands are being sent
+        RCLCPP_DEBUG(this->get_logger(), "Published velocity: linear=%.2f, angular=%.2f", 
+                    forward_speed, angular_velocity);
     }
     
     void execute_move_under_shelf()
     {
-        // We want to move 30cm under the shelf
-        const double UNDER_SHELF_DISTANCE = 0.3;  // 30cm as specified in requirements
+        // Calculate distance to under-shelf position in world coordinates
+        double dx = under_shelf_x_ - robot_x_;
+        double dy = under_shelf_y_ - robot_y_;
+        double distance_to_target = std::sqrt(dx*dx + dy*dy);
         
-        // Track how long we've been in this state for timeout purposes
-        rclcpp::Duration elapsed_move = this->now() - move_start_time_;
-        movement_phase_duration_ = elapsed_move.seconds();
-        
-        // Timeout after 15 seconds (longer than should be needed)
-        const double TIMEOUT = 15.0;
-        
-        if (movement_phase_duration_ > TIMEOUT) {
-            RCLCPP_ERROR(this->get_logger(), "Timeout while moving under shelf!");
-            stop_robot();
-            state_ = LIFTING_SHELF;  // Try to lift anyway
-            return;
-        }
-        
-        // Log the distance moved so far
+        // Log progress without mentioning angle - we're moving straight
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "Moving under shelf: %.2f/%.2f meters", 
-            distance_moved_, UNDER_SHELF_DISTANCE);
+            "Moving straight under shelf: Robot at (%.2f, %.2f), target at (%.2f, %.2f), distance: %.2f",
+            robot_x_, robot_y_, under_shelf_x_, under_shelf_y_, distance_to_target);
         
-        // Keep moving until we've moved the desired distance
-        if (distance_moved_ < UNDER_SHELF_DISTANCE) {
-            // Continue moving forward
-            geometry_msgs::msg::Twist cmd_vel;
-            cmd_vel.linear.x = 0.15;  // Constant forward speed
-            cmd_vel.angular.z = 0.0;  // No rotation
-            vel_publisher_->publish(cmd_vel);
-        } else {
-            // We've moved far enough
+        // If we're close enough to the target
+        if (distance_to_target < 0.05) { // 5cm threshold, more precise for final positioning
             stop_robot();
-            RCLCPP_INFO(this->get_logger(), "*** COMPLETED UNDER-SHELF MOVEMENT (%.2f meters) ***", 
-                distance_moved_);
+            RCLCPP_INFO(this->get_logger(), "*** REACHED UNDER-SHELF POSITION ***");
             
             // Wait to ensure robot is fully stopped
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -538,7 +516,24 @@ private:
             // Transition to lifting shelf
             state_ = LIFTING_SHELF;
             RCLCPP_INFO(this->get_logger(), "*** READY TO LIFT SHELF ***");
+            return;
         }
+        
+        // Set speed based on distance - move slower for more precise positioning
+        double forward_speed = 0.15; // Base speed
+        if (distance_to_target < 0.15) {
+            forward_speed = 0.1; // Even slower when very close
+        }
+        
+        // IMPORTANT CHANGE: No steering for straight motion
+        // Send velocity commands with zero angular velocity
+        geometry_msgs::msg::Twist cmd_vel;
+        cmd_vel.linear.x = forward_speed;
+        cmd_vel.angular.z = 0.0;  // Always zero - perfectly straight motion
+        vel_publisher_->publish(cmd_vel);
+        
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Moving in a perfectly straight line with speed: %.2f m/s", forward_speed);
     }
     
     void execute_lift_shelf()
@@ -549,10 +544,10 @@ private:
         std_msgs::msg::String msg;
         msg.data = "";  // Empty string is sufficient for the simulation
         
-        // Send more lift commands and with longer intervals for better reliability
-        for (int i = 0; i < 10; i++) {
+        // Send multiple lift commands for reliability
+        for (int i = 0; i < 5; i++) {
             elevator_up_publisher_->publish(msg);
-            RCLCPP_INFO(this->get_logger(), "Publishing elevator_up command %d/10", i+1);
+            RCLCPP_INFO(this->get_logger(), "Publishing elevator_up command %d/5", i+1);
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         
@@ -584,28 +579,33 @@ private:
     bool attach_to_shelf_;
     bool legs_detected_;
     bool cart_frame_published_;
-    bool reached_cart_position_;
-    bool rotation_complete_;
     
-    // Position data in robot frame (for cart frame)
-    double cart_position_x_;
-    double cart_position_y_;
-    
-    // World frame coordinates
-    double robot_x_;
-    double robot_y_;
-    double robot_yaw_;
-    double target_x_;  // Cart position in world frame
-    double target_y_;
-    double prev_x_;
-    double prev_y_;
+    // Position data
+    double robot_x_;    // Current robot x position in world frame
+    double robot_y_;    // Current robot y position in world frame
+    double robot_yaw_;  // Current robot orientation in world frame
+    double start_x_;    // Starting x position when service was called
+    double start_y_;    // Starting y position when service was called
+    double start_yaw_;  // Starting orientation when service was called
+    double cart_x_;     // Cart position x in robot frame (for TF broadcast)
+    double cart_y_;     // Cart position y in robot frame (for TF broadcast)
+    double initial_cart_x_; // Initial detected cart x position in robot frame
+    double initial_cart_y_; // Initial detected cart y position in robot frame
+    double left_leg_x_;  // Left leg x position in robot frame
+    double left_leg_y_;  // Left leg y position in robot frame  
+    double right_leg_x_; // Right leg x position in robot frame
+    double right_leg_y_; // Right leg y position in robot frame
+    double target_x_;   // Target position x in world frame (cart position)
+    double target_y_;   // Target position y in world frame (cart position)
+    double under_shelf_x_; // Target position x in world frame (30cm under shelf)
+    double under_shelf_y_; // Target position y in world frame (30cm under shelf)
+    double last_x_;     // Previous x position for distance calculation
+    double last_y_;     // Previous y position for distance calculation
     double distance_moved_;
     
     // Timing
     rclcpp::Time start_time_;
-    rclcpp::Time move_start_time_;
-    rclcpp::Time linear_move_start_;
-    double movement_phase_duration_;
+    rclcpp::Time start_under_shelf_time_;
     
     // ROS interfaces
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr vel_publisher_;
