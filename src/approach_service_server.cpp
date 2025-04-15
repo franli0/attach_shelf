@@ -436,10 +436,10 @@ private:
             // Wait to ensure robot is fully stopped
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             
-            // Calculate target position 60cm further under the shelf
-            // This position is 60cm forward from current position in robot's forward direction
-            under_shelf_x_ = robot_x_ + 0.6 * std::cos(robot_yaw_);
-            under_shelf_y_ = robot_y_ + 0.6 * std::sin(robot_yaw_);
+            // Calculate target position 70cm further under the shelf
+            // This position is 70cm forward from current position in robot's forward direction
+            under_shelf_x_ = robot_x_ + 0.7 * std::cos(robot_yaw_);
+            under_shelf_y_ = robot_y_ + 0.7 * std::sin(robot_yaw_);
             
             RCLCPP_INFO(this->get_logger(), "*** CALCULATED UNDER-SHELF POSITION (%.2f, %.2f) ***", 
                        under_shelf_x_, under_shelf_y_);
@@ -458,7 +458,7 @@ private:
         if (std::abs(target_angle) > 0.3) {  // Reduced threshold for earlier correction
             forward_speed = 0.0;  // Stop forward motion
             // Turn with proportional control - more aggressive
-            angular_velocity = 0.8 * target_angle;
+            angular_velocity = 0.6 * target_angle;
             // Limit angular velocity
             angular_velocity = std::max(-0.5, std::min(0.5, angular_velocity));
             
