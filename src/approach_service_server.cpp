@@ -30,7 +30,7 @@ public:
         // Adjustable parameters for easy modification
         cart_position_offset_x_ = 0.22;  // Forward adjustment for cart_frame
         cart_position_offset_y_ = 0.0;   // Lateral adjustment for cart_frame
-        under_shelf_distance_ = 0.2;     // Distance to move under the shelf (in meters)
+        under_shelf_distance_ = 0.3;     // Distance to move under the shelf (in meters)
         
         // Initialize position tracking
         robot_x_ = 0.0;
@@ -63,8 +63,8 @@ public:
         timer_ = this->create_wall_timer(50ms, std::bind(&ApproachServiceServer::timer_callback, this));
         
         RCLCPP_INFO(this->get_logger(), "Approach Service Server started");
-        RCLCPP_INFO(this->get_logger(), "Using cart position offsets: x=%.2f m, y=%.2f m", 
-                   cart_position_offset_x_, cart_position_offset_y_);
+        // RCLCPP_INFO(this->get_logger(), "Using cart position offsets: x=%.2f m, y=%.2f m", 
+        //            cart_position_offset_x_, cart_position_offset_y_);
         RCLCPP_INFO(this->get_logger(), "Under-shelf distance: %.2f m", under_shelf_distance_);
     }
 
@@ -296,53 +296,55 @@ private:
         // Calculate distance between legs
         double leg_distance = std::sqrt(std::pow(right_leg_x_ - left_leg_x_, 2) + 
                                       std::pow(right_leg_y_ - left_leg_y_, 2));
-        
-        // Calculate cart position (midpoint between legs) with offset
-        double cart_x = (left_leg_x_ + right_leg_x_) / 2.0 + cart_position_offset_x_;
-        double cart_y = (left_leg_y_ + right_leg_y_) / 2.0 + cart_position_offset_y_;
-        
+
+        // Calculate cart position with an intentional rightward bias
+        // Original midpoint calculation
+        double midpoint_x = (left_leg_x_ + right_leg_x_) / 2.0;
+        double midpoint_y = (left_leg_y_ + right_leg_y_) / 2.0;
+
+        // Add rightward bias (negative y in robot frame is to the right)
+        double rightward_bias = -0.05;  // 5cm to the right
+
+        // Final cart position with offsets
+        cart_x_ = midpoint_x + cart_position_offset_x_;
+        cart_y_ = midpoint_y + cart_position_offset_y_ + rightward_bias;
+
         RCLCPP_INFO(this->get_logger(), 
             "Shelf legs detected! Left leg: (%.2f, %.2f), Right leg: (%.2f, %.2f), Distance: %.2f m",
             left_leg_x_, left_leg_y_, right_leg_x_, right_leg_y_, leg_distance);
-        
-        RCLCPP_INFO(this->get_logger(), "Unadjusted cart position: (%.2f, %.2f)",
-                   (left_leg_x_ + right_leg_x_) / 2.0, (left_leg_y_ + right_leg_y_) / 2.0);
-        RCLCPP_INFO(this->get_logger(), "Adjusted cart position: (%.2f, %.2f) (offset: x=%.2f, y=%.2f)",
-                   cart_x, cart_y, cart_position_offset_x_, cart_position_offset_y_);
-        
-        // Transform cart position to world (odom) frame
-        double world_cart_x = robot_x_ + cart_x * std::cos(robot_yaw_) - cart_y * std::sin(robot_yaw_);
-        double world_cart_y = robot_y_ + cart_x * std::sin(robot_yaw_) + cart_y * std::cos(robot_yaw_);
-        
-        // Store in member variables for later use
-        cart_x_ = cart_x;
-        cart_y_ = cart_y;
-        world_cart_x_ = world_cart_x;
-        world_cart_y_ = world_cart_y;
-        
+
+        RCLCPP_INFO(this->get_logger(), "Original midpoint: (%.2f, %.2f)",
+                   midpoint_x, midpoint_y);
+        RCLCPP_INFO(this->get_logger(), "Adjusted cart position: (%.2f, %.2f) (with rightward bias of %.2f m)",
+                   cart_x_, cart_y_, rightward_bias);
+
+        // Transform cart position to world frame
+        world_cart_x_ = robot_x_ + cart_x_ * std::cos(robot_yaw_) - cart_y_ * std::sin(robot_yaw_);
+        world_cart_y_ = robot_y_ + cart_x_ * std::sin(robot_yaw_) + cart_y_ * std::cos(robot_yaw_);
+
         RCLCPP_INFO(this->get_logger(), "Cart frame in world coordinates: (%.2f, %.2f)",
                    world_cart_x_, world_cart_y_);
-        
+
         // Calculate the direction from robot to cart
         double dx = world_cart_x_ - robot_x_;
         double dy = world_cart_y_ - robot_y_;
         double distance = std::sqrt(dx*dx + dy*dy);
-        
+
         RCLCPP_INFO(this->get_logger(), "Robot at (%.2f, %.2f), distance to cart: %.2f m",
                    robot_x_, robot_y_, distance);
-        
+
         // Publish the cart_frame transform
         publish_cart_transform();
-        
+
         // Mark legs as detected
         legs_detected_ = true;
-        
+
         // If we're not supposed to attach, just publish TF and complete
         if (!attach_to_shelf_) {
             complete_service(true);
             return;
         }
-        
+
         // Start movement to cart
         state_ = MOVING_TO_CART;
         RCLCPP_INFO(this->get_logger(), "Starting to move towards cart position");
@@ -427,54 +429,51 @@ private:
         double angle_to_cart = std::atan2(dy, dx);
         double angle_error = normalize_angle(angle_to_cart - robot_yaw_);
         
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "Moving to cart: Robot at (%.2f, %.2f, %.2f), Cart at (%.2f, %.2f), Distance: %.2f m, Angle error: %.2f rad",
-            robot_x_, robot_y_, robot_yaw_, world_cart_x_, world_cart_y_, distance, angle_error);
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "Moving to cart: Distance: %.2f m, Angle error: %.2f rad",
+            distance, angle_error);
         
         // If we've reached the cart
         if (distance < 0.1) {  // 10cm threshold
             stop_robot();
             RCLCPP_INFO(this->get_logger(), "Reached cart position");
             
-            // Calculate position for moving under the shelf
-            // Use the user-configurable distance parameter
-            under_shelf_x_ = robot_x_ + under_shelf_distance_ * std::cos(robot_yaw_);
-            under_shelf_y_ = robot_y_ + under_shelf_distance_ * std::sin(robot_yaw_);
-            
-            RCLCPP_INFO(this->get_logger(), "Under-shelf position: (%.2f, %.2f) with distance %.2f m",
-                       under_shelf_x_, under_shelf_y_, under_shelf_distance_);
-            
-            // Transition to moving under the shelf
+            // Move directly to under-shelf movement
             state_ = MOVING_UNDER_SHELF;
+            movement_timer_ = 0.0;  // Reset timer for under-shelf movement
+            RCLCPP_INFO(this->get_logger(), "Starting under-shelf movement");
             return;
         }
         
-        // Simple proportional control for movement
+        // SIMPLER COMBINED APPROACH - always move and turn at same time
+        // Use larger threshold (0.15 rad ≈ 8.6 degrees) for better progress
         double forward_speed = 0.0;
         double angular_velocity = 0.0;
         
-        // First, ensure the robot is pointing toward the target
-        if (std::abs(angle_error) > 0.1) {  // ~6 degrees
-            // Just rotate in place
-            forward_speed = 0.0;
-            angular_velocity = 0.5 * angle_error;
-            
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "Aligning with cart, angle error: %.2f rad", angle_error);
-        } else {
-            // We're aligned, now move forward
-            forward_speed = std::min(0.2, 0.5 * distance);
-            
-            // Small steering correction to maintain alignment
-            angular_velocity = 0.5 * angle_error;
-            
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "Moving to cart, distance: %.2f m, speed: %.2f m/s", distance, forward_speed);
+        // Always apply angular correction
+        angular_velocity = 0.3 * angle_error;  // Stronger correction
+        
+        // Ensure minimum angular velocity to overcome friction when needed
+        if (std::abs(angle_error) > 0.1 && std::abs(angular_velocity) < 0.1) {
+            angular_velocity = (angle_error > 0) ? 0.1 : -0.1;
         }
         
-        // Limit velocities
-        forward_speed = std::max(0.0, std::min(0.2, forward_speed));
+        // Always move forward, but slower when alignment is poor
+        if (std::abs(angle_error) > 0.2) {
+            // Large angle error, move slowly
+            forward_speed = 0.1;
+        } else {
+            // Good alignment, move faster
+            forward_speed = 0.25;
+        }
+        
+        // Limit velocities 
+        forward_speed = std::max(0.0, std::min(0.3, forward_speed));
         angular_velocity = std::max(-0.5, std::min(0.5, angular_velocity));
+        
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "Cart approach: speed=%.2f m/s, angular=%.2f rad/s, distance=%.2f m, angle_error=%.2f rad",
+            forward_speed, angular_velocity, distance, angle_error);
         
         // Send velocity commands
         geometry_msgs::msg::Twist cmd_vel;
@@ -492,41 +491,44 @@ private:
     
     void execute_move_under_shelf()
     {
-        // Calculate distance to under-shelf position
-        double dx = under_shelf_x_ - robot_x_;
-        double dy = under_shelf_y_ - robot_y_;
-        double distance = std::sqrt(dx*dx + dy*dy);
-        
-        // Calculate angle to target
-        double angle_to_target = std::atan2(dy, dx);
-        double angle_error = normalize_angle(angle_to_target - robot_yaw_);
-        
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "Moving under shelf: Distance: %.2f m, Angle error: %.2f rad",
-            distance, angle_error);
-        
-        // If we've reached the under-shelf position
-        if (distance < 0.05) {  // 5cm threshold
+        // Very simple timed approach with phases
+        movement_timer_ += 0.05;  // 50ms per timer tick
+
+        // Simple state machine with timing
+        if (movement_timer_ < 0.5) {  // First 0.5 seconds - just stop and prepare
             stop_robot();
-            RCLCPP_INFO(this->get_logger(), "Reached under-shelf position");
-            
-            // Transition to lifting
-            state_ = LIFTING_SHELF;
-            return;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                "Preparing for under-shelf movement...");
+        } 
+        else if (movement_timer_ < 2.0) {  // Next 1.5 seconds - right turn in place
+            // Turn right in place to better align
+            geometry_msgs::msg::Twist cmd_vel;
+            cmd_vel.linear.x = 0.0;
+            cmd_vel.angular.z = -0.2;  // Right turn
+            vel_publisher_->publish(cmd_vel);
+
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                "Phase 1: Turning right in place...");
         }
-        
-        // Simple movement - slower speed for precision
-        double forward_speed = 0.1;  // 10cm/s
-        
-        // Small steering correction to keep straight
-        double angular_velocity = 0.2 * angle_error;
-        angular_velocity = std::max(-0.1, std::min(0.1, angular_velocity));  // Strict limit
-        
-        // Send velocity commands
-        geometry_msgs::msg::Twist cmd_vel;
-        cmd_vel.linear.x = forward_speed;
-        cmd_vel.angular.z = angular_velocity;
-        vel_publisher_->publish(cmd_vel);
+        else if (movement_timer_ < 5.0) {  // Next 3 seconds - forward movement
+            // Move forward
+            geometry_msgs::msg::Twist cmd_vel;
+            cmd_vel.linear.x = 0.15;  // Forward movement
+            cmd_vel.angular.z = -0.02;  // Slight right bias while moving
+            vel_publisher_->publish(cmd_vel);
+
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+                "Phase 2: Moving forward under shelf...");
+        }
+        else {
+            // After 5 seconds, we're done
+            stop_robot();
+            RCLCPP_INFO(this->get_logger(), "Under-shelf movement completed!");
+
+            // Move to lifting phase
+            state_ = LIFTING_SHELF;
+            movement_timer_ = 0.0;  // Reset for potential future use
+        }
     }
     
     void execute_lift_shelf()
@@ -612,6 +614,10 @@ private:
     double right_leg_y_; // Right leg y position in robot frame
     double under_shelf_x_; // Under-shelf position x in odom frame
     double under_shelf_y_; // Under-shelf position y in odom frame
+
+    double movement_timer_ = 0.0;
+    bool moving_forward_phase_ = false;
+    bool turning_right_phase_ = false;
     
     // ROS interfaces
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr vel_publisher_;
