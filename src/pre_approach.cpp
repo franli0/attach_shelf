@@ -10,6 +10,7 @@ public:
     PreApproachNode() : Node("pre_approach_node"), 
                        state_(MOVING_FORWARD), 
                        rotation_started_(false),
+                       shutdown_counter_(0),
                        current_yaw_(0.0),
                        start_yaw_(0.0),
                        target_yaw_(0.0)
@@ -170,6 +171,9 @@ private:
                     RCLCPP_INFO(this->get_logger(), "Rotation completed. Target: %f, Actual: %f, Error: %f degrees",
                                 rotation_degrees_, rotated_amount * 180.0 / M_PI, 
                                 (target_rotation_ - rotated_amount) * 180.0 / M_PI);
+                    
+                    // Start the shutdown countdown
+                    RCLCPP_INFO(this->get_logger(), "Task completed. Node will shut down in 3 seconds...");
                 }
                 break;
             }
@@ -178,6 +182,15 @@ private:
                 // Do nothing, stay stopped
                 cmd_vel.linear.x = 0.0;
                 cmd_vel.angular.z = 0.0;
+                
+                // Increment shutdown counter
+                shutdown_counter_++;
+                
+                // Shutdown after 60 timer iterations (around 3 seconds with 50ms timer)
+                if (shutdown_counter_ >= 60) {
+                    RCLCPP_INFO(this->get_logger(), "Shutting down node...");
+                    rclcpp::shutdown();
+                }
                 break;
             }
         }
@@ -191,6 +204,7 @@ private:
     double rotation_degrees_;
     double rotation_radians_;
     bool rotation_started_;
+    int shutdown_counter_;
     
     // Orientation tracking
     double current_yaw_;
