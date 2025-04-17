@@ -10,9 +10,8 @@
     <param name="degrees" value="$(var degrees)"/>
   </node>
   
-  <!-- Launch RViz -->
-  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen">
+  <!-- Launch RViz with proper configuration file -->
+  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen" args="-d $(find-pkg-share attach_shelf)/rviz/pre_approach.rviz">
     <param name="use_sim_time" value="true"/>
-    <param name="default_display" value="rviz/pre_approach.rviz"/>
   </node>
 </launch>
