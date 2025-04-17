@@ -12,6 +12,8 @@ public:
                        state_(MOVING_FORWARD), 
                        rotation_started_(false),
                        service_called_(false),
+                       service_completed_(false),
+                       shutdown_counter_(0),
                        current_yaw_(0.0),
                        start_yaw_(0.0),
                        target_rotation_(0.0),
@@ -207,8 +209,8 @@ private:
                     RCLCPP_INFO(this->get_logger(), "Waiting for approach_shelf service to be available...");
                     if (!client_->wait_for_service(std::chrono::seconds(5))) {
                         RCLCPP_ERROR(this->get_logger(), "Service /approach_shelf not available after 5 seconds");
-                        // Wait a bit then try again
-                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        // Move to stopped state and prepare for shutdown
+                        state_ = STOPPED;
                         return;
                     }
                     
@@ -219,19 +221,26 @@ private:
                     RCLCPP_INFO(this->get_logger(), "Calling approach service with attach_to_shelf=%s", 
                               final_approach_ ? "true" : "false");
                     
-                    // Send async request without blocking or spinning the node
-                    auto callback = [this](rclcpp::Client<attach_shelf::srv::GoToLoading>::SharedFuture future) {
-                        try {
-                            auto result = future.get();
-                            RCLCPP_INFO(this->get_logger(), "Service call completed with result: %s", 
-                                      result->complete ? "success" : "failure");
-                        } catch (const std::exception &e) {
-                            RCLCPP_ERROR(this->get_logger(), "Service call failed: %s", e.what());
-                        }
-                        state_ = STOPPED;
-                    };
-                    
-                    auto future_result = client_->async_send_request(request, callback);
+                    // Send async request
+                    auto future = client_->async_send_request(
+                        request,
+                        [this](rclcpp::Client<attach_shelf::srv::GoToLoading>::SharedFuture future) {
+                            try {
+                                auto result = future.get();
+                                RCLCPP_INFO(this->get_logger(), "Service call completed with result: %s", 
+                                          result->complete ? "success" : "failure");
+                                
+                                service_completed_ = true;
+                                
+                                // Move to stopped state
+                                state_ = STOPPED;
+                                RCLCPP_INFO(this->get_logger(), "Task completed. Node will shut down in 3 seconds...");
+                            } catch (const std::exception &e) {
+                                RCLCPP_ERROR(this->get_logger(), "Service call failed: %s", e.what());
+                                service_completed_ = false;
+                                state_ = STOPPED;
+                            }
+                        });
                     
                     service_called_ = true;
                     state_ = WAITING_FOR_SERVICE_RESULT;
@@ -244,6 +253,12 @@ private:
                 // Just wait, doing nothing while the service executes
                 cmd_vel.linear.x = 0.0;
                 cmd_vel.angular.z = 0.0;
+                
+                // Add a timeout mechanism in case the service never responds
+                if (service_wait_counter_++ > 1000) { // ~50 seconds with 50ms timer
+                    RCLCPP_ERROR(this->get_logger(), "Service call timed out after 50 seconds");
+                    state_ = STOPPED;
+                }
                 break;
             }
             case STOPPED:
@@ -251,6 +266,15 @@ private:
                 // Do nothing, stay stopped
                 cmd_vel.linear.x = 0.0;
                 cmd_vel.angular.z = 0.0;
+                
+                // Increment shutdown counter
+                shutdown_counter_++;
+                
+                // Shutdown after 60 timer iterations (around 3 seconds with 50ms timer)
+                if (shutdown_counter_ >= 60) {
+                    RCLCPP_INFO(this->get_logger(), "Shutting down node...");
+                    rclcpp::shutdown();
+                }
                 break;
             }
         }
@@ -266,6 +290,9 @@ private:
     bool rotation_started_;
     bool final_approach_;
     bool service_called_;
+    bool service_completed_;
+    int shutdown_counter_;
+    int service_wait_counter_ = 0;
     
     // Orientation tracking
     double current_yaw_;
